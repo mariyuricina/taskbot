@@ -14,6 +14,7 @@ from aiogram.types import (
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import db
+import food as food_module
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,22 +33,12 @@ CATEGORIES = {
 
 PRIORITY_LABELS = {"low": "🟢 Низкий", "medium": "🟡 Средний", "high": "🔴 Высокий"}
 
-class AddTask(StatesGroup):
-    title = State()
-    category = State()
-    priority = State()
-    assignee = State()
-    due_date = State()
-
-class EditTask(StatesGroup):
-    choose_field = State()
-    new_value = State()
-
 def main_menu():
     return ReplyKeyboardMarkup(keyboard=[
         [KeyboardButton(text="➕ Новая задача"), KeyboardButton(text="📋 Мои задачи")],
         [KeyboardButton(text="👥 Все задачи"), KeyboardButton(text="✅ Выполненные")],
         [KeyboardButton(text="⏰ Горящие"), KeyboardButton(text="📊 Статистика")],
+        [KeyboardButton(text="🍽️ Еда и холодильник")],
     ], resize_keyboard=True)
 
 def category_keyboard():
@@ -77,7 +68,7 @@ def assignee_keyboard(user_id: int):
     partner_id, partner_name = db.get_partner(user_id)
     buttons = [[InlineKeyboardButton(text="👤 Себе", callback_data="assign:me")]]
     if partner_id:
-        buttons.append([InlineKeyboardButton(text=f"👤 {partner_name}", callback_data=f"assign:partner")])
+        buttons.append([InlineKeyboardButton(text=f"👤 {partner_name}", callback_data="assign:partner")])
     buttons.append([InlineKeyboardButton(text="👥 Обоим", callback_data="assign:both")])
     buttons.append([InlineKeyboardButton(text="❌ Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -96,13 +87,8 @@ def format_task(task: dict, show_assignee: bool = True) -> str:
     emoji = next((e for e, n in CATEGORIES.items() if n == task["category"]), "📌")
     pri = PRIORITY_LABELS.get(task["priority"], "🟡 Средний")
     due = f"\n📅 До: {task['due_date']}" if task.get("due_date") else ""
-    assignee = f"\n👤 Назначено: {task['assignee_name']}" if show_assignee and task.get("assignee_name") else ""
-    done_mark = "~~" if task.get("done") else ""
-    return (
-        f"{done_mark}*{task['title']}*{done_mark}\n"
-        f"{emoji} {task['category']} · {pri}"
-        f"{due}{assignee}"
-    )
+    assignee = f"\n👤 {task['assignee_name']}" if show_assignee and task.get("assignee_name") else ""
+    return f"*{task['title']}*\n{emoji} {task['category']} · {pri}{due}{assignee}"
 
 async def send_task_list(message: Message, tasks: list, title: str, show_assignee: bool = True):
     if not tasks:
@@ -111,13 +97,22 @@ async def send_task_list(message: Message, tasks: list, title: str, show_assigne
     for task in tasks:
         text = format_task(task, show_assignee)
         await message.answer(
-            text,
-            parse_mode="Markdown",
+            text, parse_mode="Markdown",
             reply_markup=task_actions_keyboard(task["id"], task.get("done", False))
         )
 
+class AddTask(StatesGroup):
+    title = State()
+    category = State()
+    priority = State()
+    assignee = State()
+    due_date = State()
+
+class EditTask(StatesGroup):
+    choose_field = State()
+    new_value = State()
+
 async def check_reminders(bot: Bot):
-    logger.info("Checking reminders...")
     today = date.today().isoformat()
     tomorrow = (date.today() + timedelta(days=1)).isoformat()
     tasks_today = db.get_tasks_due(today)
@@ -133,14 +128,15 @@ async def check_reminders(bot: Bot):
     for uid, tasks in notified.items():
         lines = []
         for t in tasks:
-            due = t["due_date"]
-            label = "сегодня" if due == today else "завтра"
+            label = "сегодня" if t["due_date"] == today else "завтра"
             lines.append(f"• *{t['title']}* — {label}")
         text = "⏰ *Напоминание о задачах:*\n\n" + "\n".join(lines)
         try:
             await bot.send_message(uid, text, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Could not send reminder to {uid}: {e}")
+            logger.warning(f"Reminder error for {uid}: {e}")
+
+    await food_module.check_expiry(bot)
 
 async def main():
     if not BOT_TOKEN:
@@ -151,26 +147,24 @@ async def main():
     storage = MemoryStorage()
     dp = Dispatcher(storage=storage)
 
+    dp.include_router(food_module.router)
+
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(check_reminders, "cron", hour=9, minute=0, args=[bot])
     scheduler.start()
 
-    # ── /start ──────────────────────────────────────────────────────────────
     @dp.message(CommandStart())
     async def cmd_start(message: Message):
         user = message.from_user
         db.upsert_user(user.id, user.full_name, user.username)
         await message.answer(
             f"Привет, {user.first_name}! 👋\n\n"
-            "Я помогу вам с партнёром держать дела под контролем.\n\n"
-            "Чтобы связать аккаунты с партнёром, используй команду:\n"
-            "`/pair @username_партнёра`\n\n"
-            "Или сразу начни добавлять задачи 👇",
+            "Я помогу держать дела и холодильник под контролем 🙂\n\n"
+            "Чтобы связать аккаунт с партнёром:\n`/pair @username`",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
 
-    # ── /pair ───────────────────────────────────────────────────────────────
     @dp.message(Command("pair"))
     async def cmd_pair(message: Message):
         args = message.text.split(maxsplit=1)
@@ -182,7 +176,7 @@ async def main():
         if not partner:
             await message.answer(
                 f"Пользователь @{username} не найден.\n"
-                "Попроси партнёра сначала написать боту /start, а потом повтори попытку."
+                "Попроси партнёра сначала написать /start, а потом повтори."
             )
             return
         if partner["id"] == message.from_user.id:
@@ -190,21 +184,18 @@ async def main():
             return
         db.set_pair(message.from_user.id, partner["id"])
         await message.answer(
-            f"✅ Теперь ты связан с *{partner['name']}*!\n"
-            "Вы можете назначать задачи друг другу.",
+            f"✅ Теперь ты связан с *{partner['name']}*!",
             parse_mode="Markdown"
         )
         try:
             await bot.send_message(
                 partner["id"],
-                f"✅ *{message.from_user.full_name}* связал(а) с тобой аккаунт!\n"
-                "Теперь вы можете назначать задачи друг другу.",
+                f"✅ *{message.from_user.full_name}* связал(а) с тобой аккаунт!",
                 parse_mode="Markdown"
             )
         except Exception:
             pass
 
-    # ── Новая задача ─────────────────────────────────────────────────────────
     @dp.message(F.text == "➕ Новая задача")
     async def new_task_start(message: Message, state: FSMContext):
         await state.set_state(AddTask.title)
@@ -227,7 +218,7 @@ async def main():
         await state.update_data(priority=callback.data[4:])
         await state.set_state(AddTask.assignee)
         await callback.message.edit_text(
-            "Кому назначить задачу?",
+            "Кому назначить?",
             reply_markup=assignee_keyboard(callback.from_user.id)
         )
 
@@ -237,21 +228,18 @@ async def main():
         uid = callback.from_user.id
         partner_id, partner_name = db.get_partner(uid)
         user = db.get_user(uid)
-
         if choice == "me":
             assignees = [(uid, user["name"])]
         elif choice == "partner" and partner_id:
             assignees = [(partner_id, partner_name)]
-        else:  # both
+        else:
             assignees = [(uid, user["name"])]
             if partner_id:
                 assignees.append((partner_id, partner_name))
-
         await state.update_data(assignees=assignees)
         await state.set_state(AddTask.due_date)
         await callback.message.edit_text(
-            "📅 Укажи дедлайн в формате ДД.ММ.ГГГГ\n"
-            "или напиши *нет* если дедлайна нет:",
+            "📅 Дедлайн (ДД.ММ.ГГГГ) или *нет*:",
             parse_mode="Markdown"
         )
 
@@ -265,10 +253,8 @@ async def main():
             except ValueError:
                 await message.answer("Неверный формат. Введи дату как ДД.ММ.ГГГГ или напиши *нет*:", parse_mode="Markdown")
                 return
-
         data = await state.get_data()
         await state.clear()
-
         for assignee_id, assignee_name in data["assignees"]:
             db.add_task(
                 creator_id=message.from_user.id,
@@ -279,22 +265,19 @@ async def main():
                 priority=data["priority"],
                 due_date=due_date,
             )
-
         names = ", ".join(n for _, n in data["assignees"])
         await message.answer(
-            f"✅ *{data['title']}* добавлена!\nНазначено: {names}",
+            f"✅ *{data['title']}* добавлена! Назначено: {names}",
             parse_mode="Markdown",
             reply_markup=main_menu()
         )
 
-    # ── Отмена ───────────────────────────────────────────────────────────────
     @dp.callback_query(F.data == "cancel")
     async def cancel_action(callback: CallbackQuery, state: FSMContext):
         await state.clear()
         await callback.message.delete()
         await callback.message.answer("Отменено.", reply_markup=main_menu())
 
-    # ── Мои задачи ───────────────────────────────────────────────────────────
     @dp.message(F.text == "📋 Мои задачи")
     async def my_tasks(message: Message):
         tasks = db.get_tasks(assignee_id=message.from_user.id, done=False)
@@ -304,9 +287,7 @@ async def main():
     async def all_tasks(message: Message):
         uid = message.from_user.id
         partner_id, _ = db.get_partner(uid)
-        ids = [uid]
-        if partner_id:
-            ids.append(partner_id)
+        ids = [uid] + ([partner_id] if partner_id else [])
         tasks = db.get_tasks_for_users(ids, done=False)
         await send_task_list(message, tasks, "Все задачи")
 
@@ -314,52 +295,38 @@ async def main():
     async def done_tasks(message: Message):
         uid = message.from_user.id
         partner_id, _ = db.get_partner(uid)
-        ids = [uid]
-        if partner_id:
-            ids.append(partner_id)
+        ids = [uid] + ([partner_id] if partner_id else [])
         tasks = db.get_tasks_for_users(ids, done=True)
-        await send_task_list(message, tasks, "Выполненные задачи")
+        await send_task_list(message, tasks, "Выполненные")
 
     @dp.message(F.text == "⏰ Горящие")
     async def urgent_tasks(message: Message):
         uid = message.from_user.id
         partner_id, _ = db.get_partner(uid)
-        ids = [uid]
-        if partner_id:
-            ids.append(partner_id)
+        ids = [uid] + ([partner_id] if partner_id else [])
         today = date.today().isoformat()
         soon = (date.today() + timedelta(days=3)).isoformat()
         tasks = db.get_tasks_due_range(ids, today, soon)
-        await send_task_list(message, tasks, "⏰ Горящие задачи (дедлайн ≤ 3 дня)")
+        await send_task_list(message, tasks, "⏰ Горящие (дедлайн ≤ 3 дня)")
 
-    # ── Статистика ───────────────────────────────────────────────────────────
     @dp.message(F.text == "📊 Статистика")
     async def stats(message: Message):
         uid = message.from_user.id
         partner_id, partner_name = db.get_partner(uid)
         user = db.get_user(uid)
-
-        my_stats = db.get_stats(uid)
-        text = f"📊 *Статистика*\n\n"
-        text += f"👤 *{user['name']}*\n"
-        text += f"Открытых: {my_stats['open']} · Выполнено: {my_stats['done']}\n"
-
+        my = db.get_stats(uid)
+        text = f"📊 *Статистика*\n\n👤 *{user['name']}*\nОткрытых: {my['open']} · Выполнено: {my['done']}\n"
         if partner_id:
-            p_stats = db.get_stats(partner_id)
-            text += f"\n👤 *{partner_name}*\n"
-            text += f"Открытых: {p_stats['open']} · Выполнено: {p_stats['done']}\n"
-
+            p = db.get_stats(partner_id)
+            text += f"\n👤 *{partner_name}*\nОткрытых: {p['open']} · Выполнено: {p['done']}\n"
         await message.answer(text, parse_mode="Markdown")
 
-    # ── Действия с задачей ───────────────────────────────────────────────────
     @dp.callback_query(F.data.startswith("done:"))
     async def mark_done(callback: CallbackQuery):
         task_id = int(callback.data[5:])
         db.set_task_done(task_id)
         await callback.answer("✅ Выполнено!")
-        await callback.message.edit_reply_markup(
-            reply_markup=task_actions_keyboard(task_id, done=True)
-        )
+        await callback.message.edit_reply_markup(reply_markup=task_actions_keyboard(task_id, done=True))
 
     @dp.callback_query(F.data.startswith("del:"))
     async def delete_task(callback: CallbackQuery):
@@ -391,10 +358,7 @@ async def main():
         if field == "priority":
             await callback.message.edit_text("Выбери новый приоритет:", reply_markup=priority_keyboard())
         elif field == "due_date":
-            await callback.message.edit_text(
-                "Введи новую дату (ДД.ММ.ГГГГ) или *нет*:",
-                parse_mode="Markdown"
-            )
+            await callback.message.edit_text("Введи новую дату (ДД.ММ.ГГГГ) или *нет*:", parse_mode="Markdown")
         else:
             await callback.message.edit_text("Введи новое название:")
 
